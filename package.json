@@ -1,0 +1,13 @@
+{
+  "name": "goodfellow-sign-in",
+  "private": true,
+  "description": "Goodfellow CMS's sign-in service, for one-click Sign in with GitHub on your sites. Deployed with Cloudflare's Deploy to Cloudflare button; see README.md.",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "deploy": "node deploy.mjs"
+  },
+  "devDependencies": {
+    "wrangler": "4.151.1"
+  }
+}

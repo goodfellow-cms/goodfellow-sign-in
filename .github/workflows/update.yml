@@ -1,0 +1,34 @@
+# Keeps this copy of Goodfellow's sign-in service up to date: each week it takes the newest release of
+# Goodfellow (from npm's create-goodfellow package, a day after it's out) and pushes it, which Cloudflare
+# then deploys. It runs none of the release's code itself. Run it by hand from the Actions tab too.
+# GitHub can't change workflow files from a workflow, so this one stays as it is; README.md says if a
+# release changes it.
+name: Update
+
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          check-latest: true
+      - run: node update.mjs
+      - name: Push the update, if there is one
+        run: |
+          if [ -z "$(git status --porcelain)" ]; then echo "Already up to date."; exit 0; fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Update the sign-in service"
+          git push
