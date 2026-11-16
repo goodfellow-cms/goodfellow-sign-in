@@ -1,6 +1,6 @@
 # Goodfellow sign-in service
 
-This is [Goodfellow CMS](https://goodfellow-cms.github.io/goodfellow-cms/)'s sign-in service. Run it on your own Cloudflare account, on the free plan, and the editors of your sites on GitHub can choose **Sign in with GitHub** in the admin panel, rather than pasting a token. It keeps nothing: no tokens, no sessions and no list of editors. GitHub decides who may edit, every time.
+This is [Goodfellow CMS](https://goodfellowcms.com/)'s sign-in service. Run it on your own Cloudflare account, on the free plan, and the editors of your sites on GitHub can choose **Sign in with GitHub** in the admin panel, rather than pasting a token. It keeps nothing: no tokens, no sessions, and no list of editors. GitHub decides who may edit, every time.
 
 ## Put it online
 
@@ -20,4 +20,4 @@ Each week, this repository's **Update** workflow takes the newest release of Goo
 
 ## More
 
-[Sign-in service](https://goodfellow-cms.github.io/goodfellow-cms/docs/sign-in-service) in Goodfellow's documentation says how it works, what it keeps, and how to run it from your own computer instead.
+[Sign-in service](https://goodfellowcms.com/docs/sign-in-service) in Goodfellow's documentation says how it works, what it keeps, and how to run it from your own computer instead.

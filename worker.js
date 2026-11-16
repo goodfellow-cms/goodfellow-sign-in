@@ -121,6 +121,34 @@ async function githubAppJwt({ id, privateKey, now = Math.floor(Date.now() / 1e3)
 	};
 }
 //#endregion
+//#region src/bounded.ts
+/**
+* An answer's text, read no further than `limit` bytes: `undefined` for a
+* larger one, which is given up on there, so an address someone else chose
+* can't keep the worker reading.
+*/
+async function boundedText(response, limit) {
+	if (Number(response.headers.get("content-length")) > limit) {
+		await response.body?.cancel();
+		return;
+	}
+	const reader = response.body?.getReader();
+	if (!reader) return "";
+	const decoder = new TextDecoder();
+	let read = 0;
+	let text = "";
+	for (;;) {
+		const { done, value } = await reader.read();
+		if (done) return text + decoder.decode();
+		read += value.byteLength;
+		if (read > limit) {
+			await reader.cancel();
+			return;
+		}
+		text += decoder.decode(value, { stream: true });
+	}
+}
+//#endregion
 //#region src/github.ts
 /** GitHub answered with an error. `status` is GitHub's, or 0 if it couldn't be reached. */
 var GitHubError = class extends Error {
@@ -296,7 +324,7 @@ function appManifest(options) {
 	const worker = options.worker.replace(/\/$/, "");
 	return {
 		name: options.name,
-		url: options.homepage ?? "https://goodfellow-cms.github.io/goodfellow-cms/",
+		url: options.homepage ?? "https://goodfellowcms.com/",
 		description: DESCRIPTIONS[options.kind],
 		hook_attributes: {
 			url: worker,
@@ -407,7 +435,7 @@ function createSelfSetup(options) {
 	const githubOrigin = new URL(options.github.web).origin;
 	const htmlPage = (title, body, headers = {}, status = 200) => page$1(title, body, headers, status, githubOrigin);
 	const waitingPage = (headers = {}, seconds = RELOAD_SECONDS) => htmlPage("Set up the sign-in service", `<p role="status">Saved. Cloudflare is starting the service with its new settings, which takes a few seconds; this page goes on by itself.</p>
-<p><a href="/setup">Go on now</a></p>`, {
+<p><a href="/setup">Go on now</a> or <a href="/setup?again=1">start again</a></p>`, {
 		...headers,
 		refresh: `${seconds}; url=/setup`
 	});
@@ -455,18 +483,23 @@ function createSelfSetup(options) {
 		})).ok) throw new SetupProblem("Cloudflare didn't save the service's settings. Check the token can edit Workers, then try again.");
 	}
 	async function sealState(key, state) {
-		return (await createSealer(key, options.now)).seal(SETUP_KIND, state, SETUP_LIFETIME);
+		return `${await keyId(key)}.${await (await createSealer(key, options.now)).seal(SETUP_KIND, state, SETUP_LIFETIME)}`;
 	}
+	/** The setup's state, or `waiting` where it's sealed with a key this version doesn't have yet. */
 	async function openState(request, env) {
-		const sealed = cookie$1(request, SETUP_COOKIE);
-		if (!sealed || !env.SESSION_KEY) return void 0;
+		const [id, sealed, ...rest] = (cookie$1(request, SETUP_COOKIE) ?? "").split(".");
+		if (!id || !sealed || rest.length > 0) return void 0;
+		if (!env.SESSION_KEY || id !== await keyId(env.SESSION_KEY)) return "waiting";
 		try {
 			return await (await createSealer(env.SESSION_KEY, options.now)).open(SETUP_KIND, sealed);
 		} catch {
 			return;
 		}
 	}
-	async function form(request) {
+	async function form(request, url) {
+		const site = request.headers.get("sec-fetch-site");
+		const origin = request.headers.get("origin");
+		if (site ? site !== "same-origin" : origin !== url.origin) throw new SetupProblem("Send the form from this page.");
 		if (!(request.headers.get("content-type") ?? "").startsWith("application/x-www-form-urlencoded")) throw new SetupProblem("Send the form from this page.");
 		return new URLSearchParams(await request.text());
 	}
@@ -484,7 +517,7 @@ function createSelfSetup(options) {
 			public: state.public
 		});
 		const action = manifestAction(`${next}.${state.nonce}`, state.organization, options.github.web);
-		const what = next === "edit" ? "the editors' app, which signs editors in" : "the owners' app, which owners use to change who edits a site, its domain and its updates";
+		const what = next === "edit" ? "the editors' app, which signs editors in" : "the owners' app, which owners use to change who edits a site, its domain, and its updates";
 		return htmlPage("Set up the sign-in service", `${made.includes("edit") ? "<p>Made the editors' app.</p>" : "<p>Saved the sites' addresses.</p>"}
 <p>Next, make ${what}. GitHub shows its settings, filled in already: check the name, which people see when they sign in (GitHub needs it to be unused), and choose <strong>Create GitHub App</strong>.</p>
 <form method="post" action="${escapeHtml$1(action)}">
@@ -537,14 +570,19 @@ ${problem ? `<p class="problem" role="alert">${escapeHtml$1(problem)}</p>` : ""}
 		try {
 			if (path === "/setup" && request.method === "GET") {
 				if (isConfigured(env)) return configuredPage();
+				if (url.searchParams.has("again")) {
+					const response = firstPage();
+					response.headers.append("set-cookie", clearCookie());
+					return response;
+				}
 				const state = await openState(request, env);
+				if (state === "waiting") return waitingPage();
 				if (state) return appPage(url, state, madeApps(env, state), addressesOf(env));
-				if (cookie$1(request, SETUP_COOKIE) && !env.SESSION_KEY) return waitingPage();
 				return firstPage();
 			}
 			if (path === "/setup/token" && request.method === "POST") {
 				if (isConfigured(env)) return configuredPage();
-				const fields = await form(request);
+				const fields = await form(request, url);
 				const values = Object.fromEntries(fields);
 				const token = (fields.get("token") ?? "").trim();
 				const organization = (fields.get("organization") ?? "").trim() || void 0;
@@ -553,12 +591,12 @@ ${problem ? `<p class="problem" role="alert">${escapeHtml$1(problem)}</p>` : ""}
 					if (organization && !/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/.test(organization)) throw new SetupProblem(`${organization} isn't a GitHub organization's name.`);
 					const addresses = parseAddresses(fields.get("addresses") ?? "");
 					const account = await findWorker(env, token);
-					const key = env.SESSION_KEY ?? newSessionKey();
+					const key = newSessionKey();
 					await writeSecrets(env, {
 						token,
 						account
 					}, {
-						...!env.SESSION_KEY && { SESSION_KEY: key },
+						SESSION_KEY: key,
 						ALLOWED_ORIGINS: addresses.join(",")
 					});
 					const sealed = await sealState(key, {
@@ -569,7 +607,7 @@ ${problem ? `<p class="problem" role="alert">${escapeHtml$1(problem)}</p>` : ""}
 						nonce: base64UrlEncode(crypto.getRandomValues(/* @__PURE__ */ new Uint8Array(16))),
 						made: []
 					});
-					return waitingPage({ "set-cookie": setCookie(sealed) }, env.SESSION_KEY ? 0 : RELOAD_SECONDS);
+					return waitingPage({ "set-cookie": setCookie(sealed) });
 				} catch (error) {
 					if (error instanceof SetupProblem) return firstPage(error.message, {
 						...values,
@@ -581,7 +619,7 @@ ${problem ? `<p class="problem" role="alert">${escapeHtml$1(problem)}</p>` : ""}
 			if (path === "/setup/github/callback" && request.method === "GET") {
 				if (isConfigured(env)) return configuredPage();
 				const state = await openState(request, env);
-				if (!state) return firstPage("This setup took longer than half an hour, or started in another browser. Start again.");
+				if (typeof state !== "object") return firstPage("This setup took longer than half an hour, or started in another browser. Start again.");
 				const [kind, nonce] = (url.searchParams.get("state") ?? "").split(".");
 				const code = url.searchParams.get("code") ?? "";
 				if (kind !== "edit" && kind !== "owner" || nonce !== state.nonce || !code) return htmlPage("Set up the sign-in service", "<p class=\"problem\" role=\"alert\">GitHub came back without the app. <a href=\"/setup\">Try again</a>.</p>", {}, 400);
@@ -606,7 +644,7 @@ ${problem ? `<p class="problem" role="alert">${escapeHtml$1(problem)}</p>` : ""}
 			}
 			if (path === "/setup/addresses" && request.method === "POST") {
 				if (!isConfigured(env)) return firstPage();
-				const fields = await form(request);
+				const fields = await form(request, url);
 				try {
 					const token = (fields.get("token") ?? "").trim();
 					if (!token) throw new SetupProblem("Paste the Cloudflare API token.");
@@ -628,6 +666,10 @@ ${problem ? `<p class="problem" role="alert">${escapeHtml$1(problem)}</p>` : ""}
 		}
 	}
 	return { handle };
+}
+/** A short name for a key, which says nothing of it. */
+async function keyId(key) {
+	return base64UrlEncode(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(key))).subarray(0, 9));
 }
 function setCookie(sealed) {
 	return `${SETUP_COOKIE}=${sealed}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=${SETUP_LIFETIME / 1e3}`;
@@ -733,7 +775,7 @@ const PERMISSIONS = {
 		administration: "write",
 		pages: "write",
 		actions: "write",
-		variables: "write",
+		actions_variables: "write",
 		contents: "read",
 		metadata: "read"
 	},
@@ -757,7 +799,7 @@ const LATER_PERMISSIONS = {
 		"statuses",
 		"pull_requests"
 	],
-	owner: ["variables"],
+	owner: ["actions_variables"],
 	setup: ["secrets"]
 };
 /** `permissions` without those an installation may not have accepted yet. */
@@ -813,6 +855,31 @@ function isLocalAddress(origin) {
 	}
 	return host === "localhost" || host.endsWith(".localhost") || host === "0.0.0.0" || host === "[::1]" || /^127(\.\d{1,3}){3}$/.test(host);
 }
+/** The paths the admin panel is served at under `base`, as hosts serve its page. */
+function adminPaths(base) {
+	const root = base.replace(/\/?$/, "/");
+	return [
+		`${root}admin`,
+		`${root}admin/`,
+		`${root}admin/index.html`,
+		`${root}admin.html`
+	];
+}
+/** Where the admin panel signs in at an address whose own path is `path`: under it, or at the origin's root. */
+function adminAddress(origin, ...bases) {
+	return {
+		origin,
+		paths: [...new Set(["/", ...bases].flatMap(adminPaths))]
+	};
+}
+/** The path of an address, with a trailing slash, or `/`. */
+function pathOf(url) {
+	try {
+		return new URL(url).pathname.replace(/\/?$/, "/");
+	} catch {
+		return "/";
+	}
+}
 function originOf(url) {
 	try {
 		const parsed = new URL(url);
@@ -855,6 +922,27 @@ const PAGE_HEADERS = {
 };
 /** The cookie that shows an owner's sign-in was continued from the worker's own page, in the same browser. */
 const CONFIRM_COOKIE = "__Host-goodfellow_confirm";
+/**
+* A random value kept in the browser that starts a sign-in, whose hash the sign-in's state carries, so only that
+* browser can finish it. `Lax`, since GitHub sends the person back to the callback from its own pages.
+*/
+const STATE_COOKIE = "__Host-goodfellow_state";
+/**
+* The browser's `STATE_COOKIE`, where it has one that looks right, so sign-ins started in two of its tabs both
+* finish, or a new one, with the cookie to set, kept as long as the newest state.
+*/
+function stateCookie(request) {
+	const kept = cookie(request, STATE_COOKIE);
+	const value = kept && /^[\w-]{22,64}$/.test(kept) ? kept : base64UrlEncode(crypto.getRandomValues(/* @__PURE__ */ new Uint8Array(16)));
+	return {
+		value,
+		header: `${STATE_COOKIE}=${value}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=${STATE_LIFETIME / 1e3}`
+	};
+}
+/** The hash of a `STATE_COOKIE` value, as a sign-in's state carries it. */
+async function browserHash(value) {
+	return base64UrlEncode(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value))));
+}
 function escapeHtml(text) {
 	return text.replace(/[&<>"']/g, (char) => `&#${char.charCodeAt(0)};`);
 }
@@ -867,7 +955,7 @@ function escapeHtml(text) {
 function confirmPage(url, repo, origin, nonce) {
 	const next = new URL(url);
 	next.searchParams.set("confirm", nonce);
-	const body = `<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Sign in as an owner?</title><main style="font: 16px/1.5 system-ui, sans-serif; max-width: 36rem; margin: 4rem auto; padding: 0 1rem"><h1>Sign in as an owner?</h1><p>You're signing in with GitHub as an owner of <strong>${escapeHtml(repo)}</strong>, so the admin panel at <strong>${escapeHtml(origin)}</strong> can manage the site's editors, domain and updates.</p><p>Only continue if you opened the admin panel at that address yourself. If a link brought you here, close this page.</p><p><a href="${escapeHtml(next.href)}" style="display: inline-block; padding: 0.5rem 1rem; border-radius: 0.375rem; background: #1f2937; color: #fff; text-decoration: none">Continue to GitHub</a></p></main></html>`;
+	const body = `<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Sign in as an owner?</title><main style="font: 16px/1.5 system-ui, sans-serif; max-width: 36rem; margin: 4rem auto; padding: 0 1rem"><h1>Sign in as an owner?</h1><p>You're signing in with GitHub as an owner of <strong>${escapeHtml(repo)}</strong>, so the admin panel at <strong>${escapeHtml(origin)}</strong> can manage the site's editors, domain, and updates.</p><p>Only continue if you opened the admin panel at that address yourself. If a link brought you here, close this page.</p><p><a href="${escapeHtml(next.href)}" style="display: inline-block; padding: 0.5rem 1rem; border-radius: 0.375rem; background: #1f2937; color: #fff; text-decoration: none">Continue to GitHub</a></p></main></html>`;
 	return new Response(body, {
 		status: 200,
 		headers: {
@@ -884,6 +972,25 @@ function cookie(request, name) {
 }
 /** How long a check before signing in trusts the site's addresses it last read. */
 const ADDRESS_CHECK_MS = 12e4;
+/** How long the site's description has to answer, and the most of it read: addresses come from editors. */
+const DESCRIPTION_TIMEOUT_MS = 5e3;
+const MAX_DESCRIPTION_BYTES = 1e6;
+/**
+* How many repositories' installations and addresses a worker remembers.
+* Anyone can ask about any repository, so past this the longest remembered
+* are forgotten, and asking about many costs only the asker's own requests.
+*/
+const MAX_REMEMBERED = 1e3;
+/** Sets `key` in `map`, forgetting the entry set longest ago where it holds `MAX_REMEMBERED` already. */
+function remember(map, key, value) {
+	map.delete(key);
+	while (map.size >= MAX_REMEMBERED) {
+		const oldest = map.keys().next();
+		if (oldest.done) break;
+		map.delete(oldest.value);
+	}
+	map.set(key, value);
+}
 function createWorker(options = {}) {
 	const now = options.now ?? Date.now;
 	const sealers = /* @__PURE__ */ new Map();
@@ -968,7 +1075,7 @@ function createWorker(options = {}) {
 			if (cached && cached.id !== void 0 && now() - cached.at < 3e5) return cached.id;
 			try {
 				const { id } = await githubJson(config, `/repos/${repoPath(repo)}/installation`, { auth: { bearer: await jwtFor(app) } });
-				installations.set(key, {
+				remember(installations, key, {
 					id,
 					at: now()
 				});
@@ -1003,7 +1110,8 @@ function createWorker(options = {}) {
 		* The addresses tokens may go to: the Site address in the site's settings
 		* (`content/site.json`), read with an installation token, and the admin
 		* address and the site's other copies, such as staging, that the site's
-		* build names there, if it has them. Empty without a Site address.
+		* build names there, if it has them, each with the paths a sign-in may
+		* come back to. Empty without a Site address.
 		*/
 		async function siteAddresses(repo, token) {
 			let url;
@@ -1020,15 +1128,28 @@ function createWorker(options = {}) {
 			const site = url && originOf(url);
 			if (!url || !site) return [];
 			const { admin, broker, copies = [] } = await describedAddresses(url);
-			const addresses = broker ? [broker] : [.../* @__PURE__ */ new Set([
-				site,
-				...admin ? [admin] : [],
-				...copies
-			])];
-			return allowedOrigins.length > 0 ? addresses.filter((address) => allowedOrigins.includes(address)) : addresses;
+			const base = pathOf(url);
+			const addresses = broker ? [{
+				origin: broker.origin,
+				paths: [broker.path, `${broker.path}index.html`]
+			}] : [
+				adminAddress(site, base),
+				...admin ? [adminAddress(admin.origin, base, admin.path)] : [],
+				...copies.map((copy) => adminAddress(copy.origin, base, copy.path))
+			];
+			const merged = /* @__PURE__ */ new Map();
+			for (const address of addresses) {
+				const known = merged.get(address.origin);
+				merged.set(address.origin, {
+					origin: address.origin,
+					paths: [.../* @__PURE__ */ new Set([...known?.paths ?? [], ...address.paths])]
+				});
+			}
+			const all = [...merged.values()];
+			return allowedOrigins.length > 0 ? all.filter((address) => allowedOrigins.includes(address.origin)) : all;
 		}
 		/**
-		* The admin address, token broker and other copies of the site in its
+		* The admin address, token broker, and other copies of the site in its
 		* description (`goodfellow-site.json`, which builds write from the site's
 		* config) at the Site address, where editors sign in when the site has
 		* them. Tokens already go to the Site address, so what it serves names no
@@ -1036,16 +1157,24 @@ function createWorker(options = {}) {
 		*/
 		async function describedAddresses(siteUrl) {
 			try {
-				const response = await config.fetch(new URL("goodfellow-site.json", siteUrl.replace(/\/?$/, "/")).href, { redirect: "error" });
+				const response = await config.fetch(new URL("goodfellow-site.json", siteUrl.replace(/\/?$/, "/")).href, {
+					redirect: "error",
+					signal: AbortSignal.timeout(DESCRIPTION_TIMEOUT_MS)
+				});
 				if (!response.ok) return {};
-				const description = JSON.parse(await response.text());
+				const text = await boundedText(response, MAX_DESCRIPTION_BYTES);
+				if (text === void 0) return {};
+				const description = JSON.parse(text);
 				const address = (url) => {
 					const origin = typeof url === "string" ? originOf(url) : void 0;
-					return origin && !isLocalAddress(origin) ? origin : void 0;
+					return typeof url === "string" && origin && !isLocalAddress(origin) ? {
+						origin,
+						path: pathOf(url)
+					} : void 0;
 				};
 				const admin = address(description.admin?.url);
 				const broker = address(description.broker?.url);
-				const copies = (Array.isArray(description.copies) ? description.copies : []).map(address).filter((origin) => origin !== void 0);
+				const copies = (Array.isArray(description.copies) ? description.copies : []).map(address).filter((found) => found !== void 0);
 				return {
 					...admin && { admin },
 					...broker && { broker },
@@ -1055,13 +1184,19 @@ function createWorker(options = {}) {
 				return {};
 			}
 		}
-		/** Checks that the app is installed on the repository and that `origin` is the site's own address, its admin address, another copy's, or its token broker's. */
-		async function checkSite(purpose, repo, origin) {
+		/**
+		* Checks that the app is installed on the repository and that `origin` is
+		* the site's own address, its admin address, another copy's, or its token
+		* broker's, and, given the `path` a sign-in comes back to, that it's the
+		* page there that signs in.
+		*/
+		async function checkSite(purpose, repo, origin, path) {
 			if (!origin || !originOf(origin) || isLocalAddress(origin)) throw new Problem("local-address", 403);
 			const app = appFor(purpose);
 			const verdict = (addresses, installation) => {
 				if (addresses.length === 0) throw new Problem("no-address", 409);
-				if (!addresses.includes(origin)) throw new Problem("wrong-address", 403);
+				const address = addresses.find((known) => known.origin === origin);
+				if (!address || path !== void 0 && !address.paths.includes(path)) throw new Problem("wrong-address", 403);
 				return installation;
 			};
 			const key = repo.toLowerCase();
@@ -1085,7 +1220,7 @@ function createWorker(options = {}) {
 			} finally {
 				await revoke(reader.token);
 			}
-			checkedAddresses.set(key, {
+			remember(checkedAddresses, key, {
 				addresses,
 				at: now()
 			});
@@ -1183,7 +1318,7 @@ function createWorker(options = {}) {
 			const issued = await withInstallation(app, repo, (installation) => purposeToken(jwt, installation, repo, session.purpose));
 			try {
 				await checkStillAllowed(session, repo, issued.token);
-				if (!(await siteAddresses(repo, issued.token)).includes(session.origin)) throw new Problem("wrong-address", 403);
+				if (!(await siteAddresses(repo, issued.token)).some((address) => address.origin === session.origin)) throw new Problem("wrong-address", 403);
 				const sealed = await sealSession(session);
 				const codeToken = await issueCode(session, code);
 				return {
@@ -1256,7 +1391,13 @@ function createWorker(options = {}) {
 		}
 		function backTo(state, params) {
 			const target = new URL(state.return);
-			for (const [key, value] of Object.entries(params)) target.searchParams.set(key, value);
+			if (state.fragment) {
+				const hash = target.hash.slice(1);
+				const at = hash.indexOf("?");
+				const query = new URLSearchParams(at === -1 ? "" : hash.slice(at + 1));
+				for (const [key, value] of Object.entries(params)) query.set(key, value);
+				target.hash = `${at === -1 ? hash : hash.slice(0, at)}?${query}`;
+			} else for (const [key, value] of Object.entries(params)) target.searchParams.set(key, value);
 			return new Response(null, {
 				status: 302,
 				headers: {
@@ -1302,13 +1443,14 @@ function createWorker(options = {}) {
 				const purpose = purposeParam === "owner" || purposeParam === "setup" ? purposeParam : "edit";
 				const back = params.get("return") ?? "";
 				const origin = originOf(back);
+				const backPath = origin ? new URL(back).pathname : "";
 				const challenge = params.get("challenge") ?? "";
 				const repo = params.get("repo") ?? void 0;
 				if (!origin || !CHALLENGE.test(challenge) || purpose !== "setup" && !REPO.test(repo ?? "")) return page("bad-request");
 				const install = params.get("install") === "1";
 				try {
 					if (purpose === "setup") checkSetupOrigin(origin);
-					else if (!install) await checkSite(purpose, repo ?? "", origin);
+					else if (!install) await checkSite(purpose, repo ?? "", origin, backPath);
 					else if (isLocalAddress(origin)) throw new Problem("local-address", 403);
 				} catch (error) {
 					if (error instanceof Problem) return page(error.problem, error.status);
@@ -1321,13 +1463,16 @@ function createWorker(options = {}) {
 						return confirmPage(url, repo ?? "", origin, fresh);
 					}
 				}
+				const browser = stateCookie(request);
 				const state = {
+					browser: await browserHash(browser.value),
 					purpose,
 					...purpose !== "setup" && { repo },
 					return: back,
 					challenge,
-					remember: params.get("remember") === "1",
-					...install && { install }
+					remember: purpose !== "owner" && params.get("remember") === "1",
+					...install && { install },
+					...params.get("fragment") === "1" && { fragment: true }
 				};
 				const sealed = await (await sealer()).seal("state", state, STATE_LIFETIME);
 				const app = appFor(purpose);
@@ -1340,13 +1485,16 @@ function createWorker(options = {}) {
 					status: 302,
 					headers: {
 						location,
-						"cache-control": "no-store"
+						"cache-control": "no-store",
+						"set-cookie": browser.header
 					}
 				});
 			}
 			if (path === "/github/callback" && request.method === "GET") {
 				const state = await (await sealer()).open("state", url.searchParams.get("state"));
 				if (!state) return page("invalid");
+				const browser = cookie(request, STATE_COOKIE);
+				if (!browser || !state.browser || await browserHash(browser) !== state.browser) return page("invalid");
 				const code = url.searchParams.get("code");
 				const app = appFor(state.purpose);
 				if (!code && url.searchParams.get("installation_id")) {
@@ -1365,7 +1513,7 @@ function createWorker(options = {}) {
 				}
 				const origin = new URL(state.return).origin;
 				if (state.install && state.repo) try {
-					await checkSite(state.purpose, state.repo, origin);
+					await checkSite(state.purpose, state.repo, origin, new URL(state.return).pathname);
 				} catch (error) {
 					if (error instanceof Problem) return page(error.problem, error.status);
 					throw error;
